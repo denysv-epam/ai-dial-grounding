@@ -1,13 +1,12 @@
 import asyncio
 from typing import Any
-from langchain_core.messages import SystemMessage, HumanMessage
+
+from langchain_core.messages import HumanMessage, SystemMessage, content
 from langchain_openai import AzureChatOpenAI
 from pydantic import SecretStr
-from task._constants import DIAL_URL, API_KEY
-from task.user_client import UserClient
 
-#TODO:
-# Before implementation open the `flow_diagram.png` to see the flow of app
+from task._constants import API_KEY, DIAL_URL
+from task.user_client import UserClient
 
 BATCH_SYSTEM_PROMPT = """You are a user search assistant. Your task is to find users from the provided list that match the search criteria.
 
@@ -49,38 +48,72 @@ class TokenTracker:
 
     def get_summary(self):
         return {
-            'total_tokens': self.total_tokens,
-            'batch_count': len(self.batch_tokens),
-            'batch_tokens': self.batch_tokens
+            "total_tokens": self.total_tokens,
+            "batch_count": len(self.batch_tokens),
+            "batch_tokens": self.batch_tokens,
         }
 
-#TODO:
-# 1. Create AzureChatOpenAI client
-#    hint: api_version set as empty string if you gen an error that indicated that api_version cannot be None
-# 2. Create TokenTracker
+
+token_tracker = TokenTracker()
+client = AzureChatOpenAI(
+    temperature=0.0,
+    azure_deployment="gpt-4o",
+    azure_endpoint=DIAL_URL,
+    api_key=SecretStr(API_KEY),
+    api_version="",
+)
+
 
 def join_context(context: list[dict[str, Any]]) -> str:
-    #TODO:
-    # You cannot pass raw JSON with user data to LLM (" sign), collect it in just simple string or markdown.
-    # You need to collect it in such way:
-    # User:
-    #   name: John
-    #   surname: Doe
-    #   ...
-    raise NotImplementedError
+    context_str = ""
+    for user in context:
+        context_str += f"User:\n"
+        for key, value in user.items():
+            context_str += f"  {key}: {value}\n"
+        context_str += "\n"
+    return context_str
+
+
+def _normalize_content(value: Any) -> str:
+    """Normalize LangChain message content to a plain string.
+
+    Content from LLMs can be a string or a list of content blocks
+    (e.g., {"type": "text", "text": "..."}). This function extracts
+    textual parts and concatenates them, ensuring a string is returned.
+    """
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        parts: list[str] = []
+        for part in value:
+            if isinstance(part, dict):
+                text = part.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+            elif isinstance(part, str):
+                parts.append(part)
+        if parts:
+            return "".join(parts)
+    return str(value)
 
 
 async def generate_response(system_prompt: str, user_message: str) -> str:
     print("Processing...")
-    #TODO:
-    # 1. Create messages array with system prompt and user message
-    # 2. Generate response (use `ainvoke`, don't forget to `await` the response)
-    # 3. Get usage (hint, usage can be found in response metadata (its dict) and has name 'token_usage', that is also
-    #    dict and there you need to get 'total_tokens')
-    # 4. Add tokens to `token_tracker`
-    # 5. Print response content and `total_tokens`
-    # 5. return response content
-    raise NotImplementedError
+
+    messages = [
+        SystemMessage(content=system_prompt),
+        HumanMessage(content=user_message),
+    ]
+
+    response = await client.ainvoke(messages)
+    total_tokens = response.response_metadata.get("token_usage", {}).get(
+        "total_tokens", 0
+    )
+
+    token_tracker.add_tokens(total_tokens)
+    content_text = _normalize_content(response.content)
+    print(f"Response: \n {content_text}\nTokens used: {total_tokens}\n")
+    return content_text
 
 
 async def main():
@@ -88,30 +121,56 @@ async def main():
     print(" - Do we have someone with name John that loves traveling?")
 
     user_question = input("> ").strip()
+
     if user_question:
         print("\n--- Searching user database ---")
 
-        #TODO:
-        # 1. Get all users (use UserClient)
-        # 2. Split all users on batches (100 users in 1 batch). We need it since LLMs have its limited context window
-        # 3. Prepare tasks for async run of response generation for users batches:
-        #       - create array tasks
-        #       - iterate through `user_batches` and call `generate_response` with these params:
-        #           - BATCH_SYSTEM_PROMPT (system prompt)
-        #           - User prompt, you need to format USER_PROMPT with context from user batch and user question
-        # 4. Run task asynchronously, use method `gather` form `asyncio`
-        # 5. Filter results on 'NO_MATCHES_FOUND' (see instructions for BATCH_SYSTEM_PROMPT)
-        # 5. If results after filtration are present:
-        #       - combine filtered results with "\n\n" spliterator
-        #       - generate response with such params:
-        #           - FINAL_SYSTEM_PROMPT (system prompt)
-        #           - User prompt: you need to make augmentation of retrieved result and user question
-        # 6. Otherwise prin the info that `No users found matching`
-        # 7. In the end print info about usage, you will be impressed of how many tokens you have used. (imagine if we have 10k or 100k users 😅)
-    raise NotImplementedError
+        users = UserClient().get_all_users()
+        user_batches = [users[i : i + 100] for i in range(0, len(users), 100)]
+
+        # Process batches to find relevant users
+        tasks = [
+            generate_response(
+                system_prompt=BATCH_SYSTEM_PROMPT,
+                user_message=USER_PROMPT.format(
+                    context=join_context(user_batch), query=user_question
+                ),
+            )
+            for user_batch in user_batches
+        ]
+        batch_results = await asyncio.gather(*tasks)
+
+        print("\n--- Compiling results ---")
+
+        relevant_results = [
+            result for result in batch_results if result.strip() != "NO_MATCHES_FOUND"
+        ]
+
+        print(f"\n=== SEARCH RESULTS ===")
+        if relevant_results:
+            combined_results = "\n\n".join(relevant_results)
+
+            await generate_response(
+                system_prompt=FINAL_SYSTEM_PROMPT,
+                user_message=f"SEARCH RESULTS:\n{combined_results}\n\nORIGINAL QUERY: {user_question}",
+            )
+
+        else:
+            print(f"\n=== SEARCH RESULTS ===")
+            print(f"No users found matching '{user_question}'")
+            print("\nTry refining your search or using different keywords.")
+
+        summary = token_tracker.get_summary()
+        print(f"\n=== Performance ===")
+        print(f"Total API calls: {summary['batch_count']}")
+        print(f"Total tokens: {summary['total_tokens']}")
 
 
 if __name__ == "__main__":
+    """
+    $ docker compose up -d
+    $ python -m task.t1.no_grounding
+    """
     asyncio.run(main())
 
 
