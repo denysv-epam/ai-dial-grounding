@@ -159,6 +159,7 @@ def main():
         user_question = input("> ").strip()
         if user_question:
             if user_question.lower() in ["quit", "exit"]:
+                print("Bye")
                 break
 
             print("\n--- Retrieving context ---")
